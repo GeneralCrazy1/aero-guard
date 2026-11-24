@@ -1,6 +1,6 @@
 {
-  "versionCode": 21,
-  "versionName": "1.1.4b (Alpha)",
+  "versionCode": 22,
+  "versionName": "1.1.4C (Alpha)",
   "apkUrl": "Aero-Guard.apk",
   "changes": [
     "Ruhezeit: Das Radar läuft jetzt auch in der Ruhezeit weiter (Radar, Liste und Karte bleiben aktuell), es meldet nur nichts. Vorher wurde es pausiert. Die Einstellungen erklären Ruhezeit und Zeitplan neu und warnen, wenn sich beide überschneiden. Widget-Text korrigiert (ein Icon, drei Zustände).",
