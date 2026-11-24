@@ -185,7 +185,7 @@ async function activate(req, env, checkOnly) {
   if (!rec.uid) { rec.uid = (await createUser(env, device)).uid; dirty = true; } // Handy aus der Zeit vor den User-IDs
   if (telemetry(rec, body, now, ip) || dirty) await put(env, "key:" + key, JSON.stringify(rec));
   const user = await userByUid(env, rec.uid);
-  return json({ ok: true, expiresAt: rec.expiresAt, seconds, days: Math.round(seconds / 86400), name: nameOf(rec) || (user && user.name) || "", uid: rec.uid, admin: !!(user && user.admin) });
+  return json({ ok: true, expiresAt: rec.expiresAt, seconds, days: Math.round(seconds / 86400), name: nameOf(rec) || (user && user.name) || "", uid: rec.uid, admin: !!(user && user.admin), master: !!(user && user.master) });
 }
 
 async function adminCreate(req, env) {
