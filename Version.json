@@ -1,21 +1,15 @@
 {
-  "version": 3,
-  "artifactType": {
-    "type": "APK",
-    "kind": "Directory"
-  },
-  "applicationId": "de.aeroguard.app",
-  "variantName": "debug",
-  "elements": [
-    {
-      "type": "SINGLE",
-      "filters": [],
-      "attributes": [],
-      "versionCode": 13,
-      "versionName": "1.1.1A",
-      "outputFile": "app-debug.apk"
-    }
-  ],
-  "elementType": "File",
-  "minSdkVersionForDexing": 26
+  "versionCode": 16,
+  "versionName": "1.1.3A",
+  "apkUrl": "Aero-Guard.apk",
+  "changes": [
+    "Fehler behoben: Die Uhr hat das Radar nachts EINgeschaltet statt Ruhe zu geben. Neu ist die Ruhezeit: In diesem Zeitraum gibt es keine Warnungen, auch wenn das Radar von Hand gestartet wurde. Ein alter Zeitplan wurde automatisch zur Ruhezeit.",
+    "Nur noch Warnungen vor Jets, die man voraussichtlich hört (aus Höhe, Entfernung, Tempo und Typ geschätzt). Hohe Jets wie in 10.000 m bleiben auf dem Radar, lösen aber keinen Alarm aus.",
+    "Nach einem Vorbeiflug fragt die App leise: „War der Flieger laut?“ Mit Ja/Nein lernt sie die Hörweite für jeden Flugzeugtyp.",
+    "Karte: Militärflugplätze mit Zahl der gelandeten Jets. Landet ein Jet, zählt die App hoch, hebt derselbe wieder ab, zählt sie runter.",
+    "Linie, woher ein Flieger kommt, gestrichelt wohin er fliegt, dazu Startort. Auf der Karte lässt sich die ganze Route laden.",
+    "Neues Widget mit zwei Knöpfen: Radar an/aus und Ruhezeit an/aus. Es lässt sich direkt aus der App auf den Startbildschirm legen.",
+    "Freischaltung per Key (frei wählbare Laufzeit, auch Sekunden zum Testen). Ein Key gilt nur auf einem Handy und bleibt bei Updates erhalten. Läuft er ab oder wird er entzogen, sperrt sich die App.",
+    "Neuer Haftungsausschluss: Bei aktiver Freischaltung meldet die App Handy-Modell, App-Version und drei Zähler (App geöffnet, Radar gestartet, Warnungen) an den Server, nie den Standort."
+  ]
 }
