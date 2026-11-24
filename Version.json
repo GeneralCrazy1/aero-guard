@@ -6,6 +6,10 @@
     "Sperren mit Grund: Wird eine Lizenz gesperrt, sieht man den Grund und kann über „Support kontaktieren“ eine Nachricht schreiben und die Antwort lesen. Gesperrt werden kann das Gerät (und zusätzlich die IP).",
     "Ohne Key: Die Karte zeigt nur die Flieger, ohne Flugplätze, Flugspur, Wikipedia-Bilder und Live-Ansicht (dort steht „nur Vollversion“). Radar und Liste bleiben gesperrt, der Test bleibt offen.",
     "Jedes Handy hat eine User-ID (Einstellungen > Freischaltung). Neu: Admin-Werkzeug für ernannte Admins: Keys aus dem eigenen Kontingent holen, per WhatsApp teilen, Restlaufzeit der ausgegebenen Keys sehen.",
+    "Admins mit Berechtigung können in der App Nutzer (User-ID) und IPs sperren, immer mit Grund. Admins, du selbst und die IP eines Admins sind geschützt. Im Admin-Panel steht bei jeder Sperre, wer sie gesetzt hat.",
+    "Master-Admin und Admin: Eigener Bereich „Admin“ in den Einstellungen (nur für Admins sichtbar) mit Übersicht, Keys, Anträgen, Support, Nutzern mit Restlaufzeit und Sperren.",
+    "Key-Ausgabe je Laufzeit: sofort, mit Begründung oder mit Genehmigung durch den Master-Admin (Genehmigen/Ablehnen in der App und im Panel). Kontingente gelten weiter.",
+    "Support ist jetzt ein Chat mit Verlauf. Bei Antworten steht „Master-Admin“ oder „Admin“ und der gespeicherte Name dabei. Im Admin-Panel siehst du, wer mit wem schreibt.",
     "Im Admin-Panel: Dashboard mit Schreibvorgängen, Nutzer-Suche nach ID/Name, Admins und Kontingente, Support-Postfach, Meldungen bei unberechtigtem Zugriff, Sperrlisten."
   ]
 }
