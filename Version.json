@@ -1,10 +1,11 @@
 {
-  "versionCode": 18,
-  "versionName": "1.1.3C",
+  "versionCode": 19,
+  "versionName": "1.1.4a - (Alpha)",
   "apkUrl": "Aero-Guard.apk",
   "changes": [
-    "Gemeinsamer Stand: Welcher Jet an welchem Militärflugplatz gelandet oder gestartet ist, teilen jetzt alle Tester. Auch eine frisch installierte App zeigt sofort den aktuellen Stand. Jedes Ereignis zählt nur einmal, egal wie viele Handys es sehen.",
-    "Deine Antworten auf „War der Flieger laut?“ fließen in eine gemeinsame Hörweite je Flugzeugtyp ein. Geteilt werden nie Standorte, nur Flugplatz, Flugzeugkennung, Uhrzeit sowie Typ, Entfernung und Ja/Nein. In den Einstellungen abschaltbar.",
-    "Widget: Nur noch ein Icon. Jeder Tipp schaltet weiter: Aus, An, Ruhe an (mit Uhrzeit), dann wieder Aus. Farbe und Symbol zeigen den Zustand."
+    "Sperren mit Grund: Wird eine Lizenz gesperrt, sieht man den Grund und kann über „Support kontaktieren“ eine Nachricht schreiben und die Antwort lesen. Gesperrt werden kann das Gerät (und zusätzlich die IP).",
+    "Ohne Key: Die Karte zeigt nur die Flieger, ohne Flugplätze, Flugspur, Wikipedia-Bilder und Live-Ansicht (dort steht „nur Vollversion“). Radar und Liste bleiben gesperrt, der Test bleibt offen.",
+    "Jedes Handy hat eine User-ID (Einstellungen > Freischaltung). Neu: Admin-Werkzeug für ernannte Admins: Keys aus dem eigenen Kontingent holen, per WhatsApp teilen, Restlaufzeit der ausgegebenen Keys sehen.",
+    "Im Admin-Panel: Dashboard mit Schreibvorgängen, Nutzer-Suche nach ID/Name, Admins und Kontingente, Support-Postfach, Meldungen bei unberechtigtem Zugriff, Sperrlisten."
   ]
 }
