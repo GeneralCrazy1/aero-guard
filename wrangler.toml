@@ -1,7 +1,7 @@
 # Cloudflare Worker für die Aero-Guard-Freischalt-Keys.
 # "name" muss genau so heißen wie dein Worker in Cloudflare.
 name = "aero-guard"
-main = "src/index.js"
+main = "index.js"
 compatibility_date = "2025-11-01"
 workers_dev = true
 # Geheimnisse (ADMIN_SECRET) aus dem Dashboard beim Deploy behalten.
