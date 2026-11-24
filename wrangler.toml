@@ -1,0 +1,13 @@
+# Cloudflare Worker für die Aero-Guard-Freischalt-Keys.
+# "name" muss genau so heißen wie dein Worker in Cloudflare.
+name = "aero-guard"
+main = "src/index.js"
+compatibility_date = "2025-11-01"
+workers_dev = true
+# Geheimnisse (ADMIN_SECRET) aus dem Dashboard beim Deploy behalten.
+keep_vars = true
+
+# Speicher für die Keys. Cloudflare legt ihn beim ersten Deploy automatisch an.
+# Hast du schon einen KV-Namespace erstellt, kannst du hier zusätzlich id = "..." eintragen.
+[[kv_namespaces]]
+binding = "KEYS"
