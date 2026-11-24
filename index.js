@@ -199,6 +199,13 @@ tr:hover td{background:#0e2339}
 #login .card{width:340px}
 .hide{display:none!important}
 .small{font-size:12.5px;color:#8aa59a}
+details.grp{border:1px solid #16304a;border-radius:10px;margin:10px 0;background:#0a1a2b}
+details.grp summary{cursor:pointer;padding:12px 14px;font-size:15px;list-style:none;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+details.grp summary::-webkit-details-marker{display:none}
+details.grp summary::before{content:"▸";color:#4cd98a;display:inline-block;width:14px}
+details.grp[open] summary::before{content:"▾"}
+details.grp .cnt{background:#17402f;border-radius:10px;padding:2px 10px;font-size:13px;font-weight:700}
+details.grp table{margin:0 0 6px}
 .acts button{padding:4px 8px;font-size:12px;margin:1px}
 @media(max-width:720px){body{flex-direction:column}#side{width:100%;height:auto;flex-direction:row;flex-wrap:wrap;position:static}#side h1{width:100%}#side .sp{display:none}}
 </style></head><body>
@@ -236,8 +243,8 @@ tr:hover td{background:#0e2339}
 <section id="p-keys" class="hide"><h2>Alle Keys</h2><div class="card">
 <div class="row"><div><label>Suche</label><input id="q" placeholder="Key oder Name"></div>
 <div><label>Status</label><select id="flt"><option value="">alle</option><option value="free">frei</option><option value="active">aktiv</option><option value="expired">abgelaufen</option><option value="revoked">gesperrt</option></select></div>
-<div><button class="sec" id="reload">↻ Neu laden</button></div></div>
-<div style="overflow:auto;margin-top:10px"><table id="keys"></table></div></div></section>
+<div><button class="sec" id="reload">↻ Neu laden</button> <button class="sec" id="expandAll">Alle auf</button> <button class="sec" id="collapseAll">Alle zu</button></div></div>
+<div style="overflow:auto;margin-top:10px"><div id="keys"></div></div></div></section>
 
 <section id="p-help" class="hide"><h2>Hilfe</h2><div class="card">
 <p><b>Frei</b> = noch nicht eingelöst. Die Laufzeit startet erst beim Einlösen.</p>
@@ -290,19 +297,32 @@ function renderHome(){
     return "<tr><td>"+esc(k.name)+"</td><td class=mono>"+k.key+"</td><td>"+fmtDate(k.activatedAt)+"</td><td><span class='tag "+status(k)+"'>"+NAMES[status(k)]+"</span>"+remaining(k)+"</td></tr>"; }).join(""):"<tr><td colspan=4 class=small>Noch nichts eingelöst.</td></tr>");
 }
 
+var OPEN={};
 function renderKeys(){
-  var q=($("q").value||"").toUpperCase(), f=$("flt").value;
+  var q=($("q").value||"").toUpperCase(), f=$("flt").value, filtering=!!(q||f);
   var list=DATA.filter(function(k){ return (!f||status(k)==f)&&(!q||k.key.indexOf(q)>=0||(k.name||"").toUpperCase().indexOf(q)>=0); });
-  $("keys").innerHTML="<tr><th>Key</th><th>Laufzeit</th><th>Name</th><th>Handy</th><th>Eingelöst</th><th>Läuft ab</th><th>Status</th><th></th></tr>"+
-  (list.length?list.map(function(k){ var s=status(k);
-    return "<tr><td class=mono>"+k.key+"</td><td>"+fmtDur(k.seconds)+"</td><td>"+esc(k.name)+"</td><td class=mono>"+(k.device||"–")+"</td><td>"+fmtDate(k.activatedAt)+"</td><td>"+fmtDate(k.expiresAt)+"</td>"+
-    "<td><span class='tag "+s+"'>"+NAMES[s]+"</span>"+remaining(k)+"</td><td class=acts>"+
-    "<button class=sec data-a=copy data-k="+k.key+">Kopieren</button>"+
-    (s!="free"&&!k.revoked?"<button class=sec data-a=extend data-k="+k.key+">Verlängern</button>":"")+
-    (k.device?"<button class=sec data-a=reset data-k="+k.key+">Handy lösen</button>":"")+
-    (k.revoked?"<button class=sec data-a=unrevoke data-k="+k.key+">Entsperren</button>":"<button class=sec data-a=revoke data-k="+k.key+">Sperren</button>")+
-    "<button class=red data-a=delete data-k="+k.key+">Löschen</button></td></tr>"; }).join(""):"<tr><td colspan=8 class=small>Keine Keys.</td></tr>");
+  var groups={}; list.forEach(function(k){ (groups[k.seconds]=groups[k.seconds]||[]).push(k); });
+  var secs=Object.keys(groups).map(Number).sort(function(a,b){return b-a;});
+  if(!secs.length){ $("keys").innerHTML="<p class=small>Keine Keys.</p>"; return; }
+  $("keys").innerHTML=secs.map(function(sec){
+    var g=groups[sec], c={free:0,active:0,expired:0,revoked:0}; g.forEach(function(k){ c[status(k)]++; });
+    var parts=[]; ["active","free","expired","revoked"].forEach(function(x){ if(c[x]) parts.push(c[x]+" "+NAMES[x]); });
+    var open=filtering||OPEN[sec];
+    var rows=g.map(function(k){ var s=status(k);
+      return "<tr><td class=mono>"+k.key+"</td><td>"+esc(k.name)+"</td><td class=mono>"+(k.device||"–")+"</td><td>"+fmtDate(k.activatedAt)+"</td><td>"+fmtDate(k.expiresAt)+"</td>"+
+      "<td><span class='tag "+s+"'>"+NAMES[s]+"</span>"+remaining(k)+"</td><td class=acts>"+
+      "<button class=sec data-a=copy data-k="+k.key+">Kopieren</button>"+
+      (s!="free"&&!k.revoked?"<button class=sec data-a=extend data-k="+k.key+">Verlängern</button>":"")+
+      (k.device?"<button class=sec data-a=reset data-k="+k.key+">Handy lösen</button>":"")+
+      (k.revoked?"<button class=sec data-a=unrevoke data-k="+k.key+">Entsperren</button>":"<button class=sec data-a=revoke data-k="+k.key+">Sperren</button>")+
+      "<button class=red data-a=delete data-k="+k.key+">Löschen</button></td></tr>"; }).join("");
+    return "<details class=grp data-s='"+sec+"'"+(open?" open":"")+"><summary><b>"+fmtDur(sec)+"</b> <span class=cnt>"+g.length+(g.length==1?" Key":" Keys")+"</span> <span class=small>"+parts.join(" · ")+"</span></summary>"+
+      "<div style='overflow:auto'><table><tr><th>Key</th><th>Name</th><th>Handy</th><th>Eingelöst</th><th>Läuft ab</th><th>Status</th><th></th></tr>"+rows+"</table></div></details>";
+  }).join("");
 }
+$("keys").addEventListener("toggle",function(e){ var d=e.target; if(d&&d.classList&&d.classList.contains("grp")) OPEN[d.getAttribute("data-s")]=d.open; },true);
+$("expandAll").onclick=function(){ document.querySelectorAll("#keys details").forEach(function(d){ d.open=true; }); };
+$("collapseAll").onclick=function(){ document.querySelectorAll("#keys details").forEach(function(d){ d.open=false; }); };
 function ago(t){ if(!t) return "–"; var m=Math.round((NOW-t)/60000); if(m<2) return "gerade eben"; if(m<60) return "vor "+m+" Min."; if(m<1440) return "vor "+Math.round(m/60)+" Std."; return "vor "+Math.round(m/1440)+" Tagen"; }
 function renderDevs(){
   var list=DATA.filter(function(k){return k.device;}).sort(function(a,b){return (b.lastSeen||0)-(a.lastSeen||0);});
