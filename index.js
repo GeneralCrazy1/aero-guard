@@ -227,14 +227,15 @@ async function adminList(env) {
   await wload(env);
   const stored = JSON.parse((await env.KEYS.get("stats:w:" + W.day)) || "{}");
   const unauth = JSON.parse((await env.KEYS.get("unauth")) || "{}");
-  const support = JSON.parse((await env.KEYS.get("support")) || "{}").msgs || [];
+  const convs = (await getSupport(env)).convs;
   const blocks = await getBlocks(env);
   const now = Date.now();
   return json({
     ok: true, now, keys: out, users,
     writes: { n: Math.max(W.n, stored.n || 0), limit: WRITE_LIMIT, day: W.day },
     unauth24: Object.values(unauth).filter((e) => now - e.t < 86400000).length,
-    supportOpen: support.filter((m) => !m.done).length,
+    supportOpen: (await getSupport(env)).convs.filter((c) => c.status === "open").length,
+    reqOpen: (await getReqs(env)).filter((r) => r.status === "pending").length,
     blocked: { devices: Object.keys(blocks.devices).length, ips: Object.keys(blocks.ips).length },
   });
 }
@@ -287,17 +288,20 @@ async function adminUser(req, env) {
   const u = await userByUid(env, String(body.uid || "").toUpperCase());
   if (!u) return json({ ok: false, error: "unknown" }, 404);
   if (body.name != null) u.name = String(body.name).slice(0, 100);
+  if (body.master != null) { u.master = body.master === true; if (u.master) u.admin = true; }
   if (body.admin != null) {
-    u.admin = body.admin === true;
-    if (u.admin && !Object.keys(u.quota || {}).length) u.quota = { "604800": { limit: 10, used: 0, reason: false }, "1209600": { limit: 3, used: 0, reason: true } };
+    u.admin = body.admin === true || !!u.master;
+    if (u.admin && !Object.keys(u.quota || {}).length) u.quota = { "604800": { limit: 10, used: 0, reason: false, mode: "instant" }, "1209600": { limit: 3, used: 0, reason: true, mode: "approval" } };
   }
+  if (body.canBlock != null) u.canBlock = body.canBlock === true;
   if (body.quota && typeof body.quota === "object") {
     const q = {};
     for (const k of Object.keys(body.quota).slice(0, 20)) {
       const secs = Math.round(Number(k));
       const v = body.quota[k] || {};
       if (!Number.isFinite(secs) || secs < MIN_SECONDS || secs > MAX_SECONDS) continue;
-      q[String(secs)] = { limit: Math.max(0, Math.min(10000, Math.round(Number(v.limit) || 0))), used: Math.max(0, Math.round(Number(v.used) || 0)), reason: v.reason === true };
+      const mode = qMode(v);
+      q[String(secs)] = { limit: Math.max(0, Math.min(10000, Math.round(Number(v.limit) || 0))), used: Math.max(0, Math.round(Number(v.used) || 0)), reason: mode !== "instant", mode };
     }
     u.quota = q;
   }
@@ -352,44 +356,117 @@ async function adminUnauth(req, env, action) {
   return json({ ok: true });
 }
 
-async function adminSupport(req, env, action) {
+// ---- Support als Chat: eine Unterhaltung je Handy, jede Nachricht mit Absender, Rolle und Name ----
+async function getSupport(env) {
   const st = JSON.parse((await env.KEYS.get("support")) || "{}");
-  const msgs = st.msgs || [];
-  if (action === "support") return json({ ok: true, msgs: msgs.map((m) => ({ ...m, device: undefined })).sort((a, b) => b.t - a.t) });
+  if (st.convs) return st;
+  // Altes Format (einzelne Nachrichten mit einer Antwort) in Unterhaltungen umwandeln
+  const convs = [];
+  for (const m of st.msgs || []) {
+    const msgs = [{ from: "user", t: m.t, text: m.text }];
+    if (m.reply) msgs.push({ from: "staff", t: m.repliedAt || m.t, text: m.reply, role: "master", name: "" });
+    convs.push({ id: m.id, device: m.device, uid: m.uid || "", name: m.name || "", model: m.model || "", key: m.key || "", status: m.done ? "done" : "open", updated: m.repliedAt || m.t, msgs });
+  }
+  return { convs };
+}
+async function saveSupport(env, st) {
+  st.convs.sort((a, b) => b.updated - a.updated);
+  st.convs.splice(100);
+  await put(env, "support", JSON.stringify({ convs: st.convs }));
+}
+function roleLabel(role) { return role === "master" ? "Master-Admin" : "Admin"; }
+function chatOut(msgs, n) { return msgs.slice(-n).map((m) => ({ from: m.from, t: m.t, text: m.text, role: m.role || "", name: m.name || "" })); }
+async function masterName(env) {
+  let cursor;
+  do {
+    const page = await env.KEYS.list({ prefix: "user:", cursor });
+    for (const k of page.keys) { const u = JSON.parse((await env.KEYS.get(k.name)) || "null"); if (u && u.master) return u.name || ""; }
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor);
+  return "";
+}
+
+async function adminSupport(req, env, action) {
+  const st = await getSupport(env);
+  if (action === "support") return json({ ok: true, convs: st.convs.map((c) => ({ ...c, device: undefined })) });
   const body = await req.json().catch(() => ({}));
-  const m = msgs.find((x) => x.id === body.id);
-  if (!m) return json({ ok: false, error: "unknown" }, 404);
-  if (action === "support-reply") { m.reply = String(body.reply || "").slice(0, 500); m.repliedAt = Date.now(); m.done = true; }
-  if (action === "support-done") m.done = body.done !== false;
-  if (action === "support-delete") msgs.splice(msgs.indexOf(m), 1);
-  await put(env, "support", JSON.stringify({ msgs }));
+  const c = st.convs.find((x) => x.id === body.id);
+  if (!c) return json({ ok: false, error: "unknown" }, 404);
+  const now = Date.now();
+  if (action === "support-reply") {
+    const text = String(body.reply || "").trim().slice(0, 500);
+    if (text.length < 2) return json({ ok: false, error: "short" }, 400);
+    c.msgs.push({ from: "staff", t: now, text, role: "master", name: await masterName(env), by: "main" });
+    c.msgs.splice(0, Math.max(0, c.msgs.length - 60));
+    c.updated = now;
+  }
+  if (action === "support-done") { c.status = body.done === false ? "open" : "done"; c.updated = now; }
+  if (action === "support-delete") st.convs.splice(st.convs.indexOf(c), 1);
+  await saveSupport(env, st);
   return json({ ok: true });
 }
 
-// App: Nachricht an den Support (auch ohne gültigen Key). Gibt die eigenen Nachrichten samt Antworten zurück.
+// App: Nachricht an den Support (auch ohne gültigen Key). Gibt den eigenen Chatverlauf zurück.
 async function support(req, env) {
   let body;
   try { body = await req.json(); } catch { return json({ ok: false, error: "format" }, 400); }
   const device = String(body.device || "").slice(0, 100);
   if (device.length < 6) return json({ ok: false, error: "format" }, 400);
   const text = String(body.text || "").trim().slice(0, 500);
-  const st = JSON.parse((await env.KEYS.get("support")) || "{}");
-  const msgs = st.msgs || [];
+  const st = await getSupport(env);
+  let c = st.convs.find((x) => x.device === device);
   const now = Date.now();
   if (text) {
     if (text.length < 3) return json({ ok: false, error: "short" }, 400);
-    if (msgs.filter((m) => m.device === device && now - m.t < 86400000).length >= 5) return json({ ok: false, error: "rate" }, 429);
+    if (c && c.msgs.filter((m) => m.from === "user" && now - m.t < 86400000).length >= 8) return json({ ok: false, error: "rate" }, 429);
     const user = await userByDevice(env, device);
     const key = normalize(body.key);
     const rec = key ? JSON.parse((await env.KEYS.get("key:" + key)) || "null") : null;
-    msgs.push({ id: Math.random().toString(36).slice(2, 10), t: now, device, uid: user ? user.uid : (rec && rec.uid) || "", name: (user && user.name) || (rec && nameOf(rec)) || "", model: String(body.model || "").slice(0, 60), key: rec ? key : "", text, reply: "", done: false });
-    msgs.splice(0, Math.max(0, msgs.length - 200));
-    await put(env, "support", JSON.stringify({ msgs }));
+    if (!c) { c = { id: Math.random().toString(36).slice(2, 10), device, uid: "", name: "", model: "", key: "", status: "open", updated: now, msgs: [] }; st.convs.push(c); }
+    c.uid = user ? user.uid : (rec && rec.uid) || c.uid;
+    c.name = (user && user.name) || (rec && nameOf(rec)) || c.name;
+    c.model = String(body.model || c.model || "").slice(0, 60);
+    if (rec) c.key = key;
+    c.msgs.push({ from: "user", t: now, text });
+    c.msgs.splice(0, Math.max(0, c.msgs.length - 60));
+    c.status = "open"; c.updated = now;
+    await saveSupport(env, st);
   }
-  return json({ ok: true, messages: msgs.filter((m) => m.device === device).slice(-10).map((m) => ({ t: m.t, text: m.text, reply: m.reply, done: m.done })) });
+  return json({ ok: true, messages: c ? chatOut(c.msgs, 30) : [] });
 }
 
-// App-Admin (z. B. Partnerin): Kontingent sehen, Keys holen, eigene Keys mit Restlaufzeit sehen.
+// App-Admin (z. B. Partnerin) und Master-Admin (du): Kontingent, Key-Anträge, Support, Nutzerliste, Sperren.
+// Modus je Laufzeit: "instant" (sofort aus dem Kontingent), "reason" (sofort, aber mit Begründung), "approval" (Antrag, der Master-Admin entscheidet).
+function qMode(q) { return q.mode === "approval" || q.mode === "reason" || q.mode === "instant" ? q.mode : (q.reason ? "reason" : "instant"); }
+async function makeKey(env, rec) {
+  let nk;
+  do { nk = newKey(); } while (await env.KEYS.get("key:" + nk));
+  await put(env, "key:" + nk, JSON.stringify(rec));
+  return nk;
+}
+async function getReqs(env) { return JSON.parse((await env.KEYS.get("reqs")) || "{}").list || []; }
+async function saveReqs(env, list) { list.splice(0, Math.max(0, list.length - 200)); await put(env, "reqs", JSON.stringify({ list })); }
+
+// Master-Admin entscheidet über einen Antrag (App oder Panel). Bei Ablehnung wird das Kontingent zurückgegeben.
+async function decideRequest(env, id, approve, note, decider) {
+  const list = await getReqs(env);
+  const r = list.find((x) => x.id === id);
+  if (!r) return { ok: false, error: "unknown" };
+  if (r.status !== "pending") return { ok: false, error: "done" };
+  const now = Date.now();
+  r.status = approve ? "approved" : "rejected";
+  r.decidedAt = now; r.decidedBy = decider; r.note = String(note || "").slice(0, 200);
+  if (approve) {
+    r.key = await makeKey(env, { seconds: r.seconds, note: "", name: r.label || "", created: now, device: null, activatedAt: null, expiresAt: null, revoked: false, issuedBy: r.uid, issueReason: r.reason, approvedBy: decider });
+  } else {
+    const u = await userByUid(env, r.uid);
+    const q = u && (u.quota || {})[String(r.seconds)];
+    if (q && q.used > 0) { q.used--; await put(env, "user:" + u.uid, JSON.stringify(u)); }
+  }
+  await saveReqs(env, list);
+  return { ok: true, key: r.key || null };
+}
+
 async function sub(req, env) {
   let body;
   try { body = await req.json(); } catch { return json({ ok: false, error: "format" }, 400); }
@@ -402,144 +479,155 @@ async function sub(req, env) {
   const now = Date.now();
   if (!rec || rec.revoked || rec.device !== device || now >= rec.expiresAt) return json({ ok: false, error: "auth" }, 403);
   const user = await userByUid(env, rec.uid);
-  if (!user || !user.admin || user.device !== device) return json({ ok: false, error: "auth" }, 403);
+  if (!user || !(user.admin || user.master) || user.device !== device) return json({ ok: false, error: "auth" }, 403);
+  const master = !!user.master;
 
   if (body.action === "issue") {
     const secs = Math.round(Number(body.seconds));
     const q = (user.quota || {})[String(secs)];
     if (!q) return json({ ok: false, error: "quota" }, 400);
     if (q.used >= q.limit) return json({ ok: false, error: "empty" }, 400);
+    const mode = qMode(q);
     const reason = String(body.reason || "").trim().slice(0, 200);
-    if (q.reason && reason.length < 5) return json({ ok: false, error: "reason" }, 400);
-    let nk;
-    do { nk = newKey(); } while (await env.KEYS.get("key:" + nk));
-    const nrec = { seconds: secs, note: "", name: String(body.name || "").slice(0, 100), created: now, device: null, activatedAt: null, expiresAt: null, revoked: false, issuedBy: user.uid, issueReason: reason };
+    if (mode !== "instant" && reason.length < 5) return json({ ok: false, error: "reason" }, 400);
+    const label = String(body.name || "").slice(0, 100);
+    if (mode === "approval" && !master) {
+      const list = await getReqs(env);
+      const id = Math.random().toString(36).slice(2, 10);
+      list.push({ id, t: now, uid: user.uid, name: user.name || "", seconds: secs, reason, label, status: "pending", key: null });
+      q.used++;
+      await saveReqs(env, list);
+      await put(env, "user:" + user.uid, JSON.stringify(user));
+      return json({ ok: true, pending: true, id, seconds: secs });
+    }
+    const nk = await makeKey(env, { seconds: secs, note: "", name: label, created: now, device: null, activatedAt: null, expiresAt: null, revoked: false, issuedBy: user.uid, issueReason: reason });
     q.used++;
-    await put(env, "key:" + nk, JSON.stringify(nrec));
     await put(env, "user:" + user.uid, JSON.stringify(user));
     return json({ ok: true, key: nk, seconds: secs });
   }
 
+  if (body.action === "decide") {
+    if (!master) return json({ ok: false, error: "perm" }, 403);
+    const r = await decideRequest(env, String(body.id || ""), body.approve === true, body.note, user.uid);
+    return json(r, r.ok ? 200 : 400);
+  }
+
+  if (body.action === "support-list" || body.action === "support-reply" || body.action === "support-done") {
+    const st = await getSupport(env);
+    if (body.action === "support-list") {
+      const open = st.convs.filter((c) => c.status === "open");
+      return json({ ok: true, support: open.slice(0, 30).map((c) => ({ id: c.id, t: c.updated, uid: c.uid, name: c.name, needsReply: c.msgs.length > 0 && c.msgs[c.msgs.length - 1].from === "user", messages: chatOut(c.msgs, 12) })) });
+    }
+    const c = st.convs.find((x) => x.id === body.id);
+    if (!c) return json({ ok: false, error: "unknown" }, 404);
+    if (body.action === "support-reply") {
+      const text = String(body.reply || "").trim().slice(0, 500);
+      if (text.length < 2) return json({ ok: false, error: "short" }, 400);
+      c.msgs.push({ from: "staff", t: now, text, role: master ? "master" : "admin", name: user.name || "", by: user.uid });
+      c.msgs.splice(0, Math.max(0, c.msgs.length - 60));
+      c.updated = now;
+    } else { c.status = "done"; c.updated = now; }
+    await saveSupport(env, st);
+    return json({ ok: true });
+  }
+
+  if (body.action === "block") return await subBlock(req, env, body, user, now);
+
+  // Status
   const quota = Object.keys(user.quota || {}).map(Number).sort((a, b) => a - b).map((s) => {
     const q = user.quota[String(s)];
-    return { seconds: s, left: Math.max(0, q.limit - q.used), limit: q.limit, reason: !!q.reason };
+    return { seconds: s, left: Math.max(0, q.limit - q.used), limit: q.limit, reason: qMode(q) !== "instant", mode: qMode(q) };
   });
   const keys = [];
+  const holderCache = {};
   let cursor;
   do {
     const page = await env.KEYS.list({ prefix: "key:", cursor });
     for (const k of page.keys) {
       const r = JSON.parse((await env.KEYS.get(k.name)) || "{}");
-      if (r.issuedBy !== user.uid) continue;
+      if (!master && r.issuedBy !== user.uid) continue;
       const state = r.revoked ? "revoked" : !r.device ? "free" : now >= r.expiresAt ? "expired" : "active";
-      const holder = r.uid ? await userByUid(env, r.uid) : null;
-      keys.push({ key: k.name.slice(4), seconds: secondsOf(r), state, expiresAt: r.expiresAt || null, remaining: state === "active" ? Math.round((r.expiresAt - now) / 1000) : 0, name: nameOf(r), holderUid: r.uid || "", holderName: (holder && holder.name) || "", created: r.created || 0 });
+      if (r.uid && !(r.uid in holderCache)) holderCache[r.uid] = await userByUid(env, r.uid);
+      const holder = r.uid ? holderCache[r.uid] : null;
+      keys.push({ key: k.name.slice(4), seconds: secondsOf(r), state, expiresAt: r.expiresAt || null, remaining: state === "active" ? Math.round((r.expiresAt - now) / 1000) : 0, name: nameOf(r), holderUid: r.uid || "", holderName: (holder && holder.name) || "", issuerUid: r.issuedBy || "", created: r.created || 0 });
     }
     cursor = page.list_complete ? null : page.cursor;
   } while (cursor);
   keys.sort((a, b) => b.created - a.created);
-  return json({ ok: true, uid: user.uid, quota, keys });
+  const blocks = await getBlocks(env);
+  const myBlocks = [];
+  for (const d of Object.keys(blocks.devices)) { const b = blocks.devices[d]; if (master || b.by === user.uid) myBlocks.push({ kind: "device", target: b.targetUid || "", reason: b.reason, at: b.at }); }
+  for (const i of Object.keys(blocks.ips)) { const b = blocks.ips[i]; if (master || b.by === user.uid) myBlocks.push({ kind: "ip", target: i, reason: b.reason, at: b.at }); }
+  const reqs = await getReqs(env);
+  const mine = reqs.filter((r) => r.uid === user.uid).slice(-20).reverse().map((r) => ({ id: r.id, t: r.t, seconds: r.seconds, status: r.status, reason: r.reason, label: r.label, key: r.key, note: r.note || "", name: r.name }));
+  const approvals = master ? reqs.filter((r) => r.status === "pending").reverse().map((r) => ({ id: r.id, t: r.t, uid: r.uid, name: r.name, seconds: r.seconds, status: r.status, reason: r.reason, label: r.label, key: null, note: "" })) : [];
+  const convsOpen = (await getSupport(env)).convs.filter((c) => c.status === "open");
+  return json({ ok: true, uid: user.uid, master, quota, keys, canBlock: master || !!user.canBlock, myBlocks, requests: mine, approvals, supportOpen: convsOpen.filter((c) => c.msgs.length && c.msgs[c.msgs.length - 1].from === "user").length });
 }
 
-// ---- Gemeinsamer Stand der Tester: Flugplätze + Hörweiten ----
-//   POST /share {key, device, events:[{icao,hex,kind:"L"|"T",t,label}], answers:[{key,slant,factor,loud,base}], reset?}
-//   -> {ok, parked:{ICAO:[{hex,since,label}]}, ranges:{TYP:km}}
-// Alles liegt in EINEM KV-Eintrag "af:state". Es wird nur geschrieben, wenn sich etwas ändert
-// (doppelte Meldungen desselben Ereignisses von mehreren Handys ändern nichts). Standorte werden nie gespeichert.
-const AF_KEEP_MS = 30 * 86400 * 1000;
-function learnRange(base, slant, factor, loud) {
-  const needed = slant / Math.max(factor, 0.1);
-  let next = base;
-  if (loud) { const t = needed * 1.15; if (base < t) next = base + 0.6 * (t - base); }
-  else { const t = needed * 0.85; if (base > t) next = base - 0.6 * (base - t); }
-  return Math.min(30, Math.max(1.5, next));
-}
-async function share(req, env) {
-  let body;
-  try { body = await req.json(); } catch { return json({ ok: false, error: "format" }, 400); }
-  const key = normalize(body.key);
-  const device = String(body.device || "").slice(0, 100);
-  if (!key || !device) return json({ ok: false, error: "format" }, 400);
-  const hit = blockHit(await getBlocks(env), device, ipOf(req));
-  if (hit) return blockedJson(hit);
-  const rec = JSON.parse((await env.KEYS.get("key:" + key)) || "null");
-  const now = Date.now();
-  if (!rec || rec.revoked || !rec.device || rec.device !== device || now >= rec.expiresAt) return json({ ok: false, error: "auth" }, 403);
+// Admin sperrt per User-ID (Gerät, optional dessen IP) oder eine IP. Nur mit Berechtigung (im Panel einstellbar), nur mit Grund,
+// nie Admins, nie sich selbst, nie die IP eines Admins. Höchstens 10 Sperren pro Tag je Admin.
+async function subBlock(req, env, body, user, now) {
+  if (!user.canBlock && !user.master) return json({ ok: false, error: "perm" }, 403);
+  const reason = String(body.reason || "").trim().slice(0, 300);
+  if (reason.length < 5) return json({ ok: false, error: "reason" }, 400);
+  const day = today();
+  if (!user.blockDay || user.blockDay.day !== day) user.blockDay = { day, n: 0 };
+  if (user.blockDay.n >= 10) return json({ ok: false, error: "limit" }, 429);
 
-  const st = JSON.parse((await env.KEYS.get("af:state")) || "{}");
-  const parked = st.parked || {};
-  const ranges = st.ranges || {};
-  let changed = false;
-  if (body.reset === true) { for (const k of Object.keys(parked)) delete parked[k]; changed = true; }
-
-  const events = Array.isArray(body.events) ? body.events.slice(0, 40) : [];
-  for (const ev of events) {
-    const icao = String((ev && ev.icao) || "").toUpperCase();
-    const hex = String((ev && ev.hex) || "").toLowerCase();
-    if (!/^[A-Z0-9]{3,5}$/.test(icao) || !/^[0-9a-f]{6}$/.test(hex)) continue;
-    let t = Number(ev.t);
-    if (!isFinite(t) || t > now + 600000 || t < now - 6 * 3600000) t = now;
-    const here = parked[icao] && parked[icao][hex];
-    if (ev.kind === "L") {
-      if (here) continue;
-      let newer = false;
-      for (const f of Object.keys(parked)) if (parked[f][hex] && parked[f][hex].s > t) newer = true;
-      if (newer) continue;
-      for (const f of Object.keys(parked)) if (parked[f][hex]) delete parked[f][hex];
-      (parked[icao] = parked[icao] || {})[hex] = { s: t, l: String(ev.label || "").slice(0, 60) };
-      changed = true;
-    } else if (ev.kind === "T") {
-      if (here && here.s <= t) { delete parked[icao][hex]; changed = true; }
-    }
-  }
-
-  const answers = Array.isArray(body.answers) ? body.answers.slice(0, 20) : [];
-  for (const a of answers) {
-    const k = String((a && a.key) || "").toUpperCase().slice(0, 30);
-    const slant = Number(a.slant), factor = Number(a.factor), base = Number(a.base);
-    if (!/^[A-Z0-9_]{2,30}$/.test(k) || !isFinite(slant) || !isFinite(factor) || slant <= 0) continue;
-    const cur = ranges[k] != null ? ranges[k] : (isFinite(base) ? Math.min(30, Math.max(1.5, base)) : 8);
-    const next = Math.round(learnRange(cur, slant, factor, a.loud === true) * 100) / 100;
-    if (ranges[k] == null || next !== ranges[k]) { ranges[k] = next; changed = true; }
-  }
-
-  for (const f of Object.keys(parked)) {
-    for (const h of Object.keys(parked[f])) if (now - parked[f][h].s > AF_KEEP_MS) { delete parked[f][h]; changed = true; }
-    if (!Object.keys(parked[f]).length) delete parked[f];
-  }
-  if (changed) await put(env, "af:state", JSON.stringify({ parked, ranges }));
-
-  const out = {};
-  for (const f of Object.keys(parked)) out[f] = Object.keys(parked[f]).map((h) => ({ hex: h, since: parked[f][h].s, label: parked[f][h].l }));
-  return json({ ok: true, now, parked: out, ranges });
-}
-
-// Neuinstallation: Hat dieses Handy (Geräte-Kennung) schon einen gültigen Key, gibt der Server ihn zurück.
-// Gesperrte oder abgelaufene Keys werden nicht zurückgegeben. Es wird nichts geschrieben.
-async function restore(req, env) {
-  let body;
-  try { body = await req.json(); } catch { return json({ ok: false, error: "format" }, 400); }
-  const device = String(body.device || "").slice(0, 100);
-  if (device.length < 6) return json({ ok: false, error: "format" }, 400);
-  const ip = ipOf(req);
-  const hit = blockHit(await getBlocks(env), device, ip);
-  if (hit) { await logUnauth(env, device, ip, "Gesperrtes Gerät/IP versucht Zugriff", body); return blockedJson(hit); }
-  const now = Date.now();
-  let best = null, cursor, revokedReason = null;
+  // IPs aller Admins und aller Keys, die der Hauptadmin ausgegeben hat, sind tabu
+  const adminUids = new Set(); // geschützte Nutzer: für Master nur Master, sonst alle Admins
+  let cursor;
   do {
-    const page = await env.KEYS.list({ prefix: "key:", cursor });
-    for (const k of page.keys) {
-      const rec = JSON.parse((await env.KEYS.get(k.name)) || "{}");
-      if (rec.device === device && rec.revoked && revokedReason == null) revokedReason = rec.revokeReason || "";
-      if (rec.device === device && !rec.revoked && rec.expiresAt > now && (!best || rec.expiresAt > best.rec.expiresAt)) best = { key: k.name.slice(4), rec };
-    }
+    const page = await env.KEYS.list({ prefix: "user:", cursor });
+    for (const k of page.keys) { const u = JSON.parse((await env.KEYS.get(k.name)) || "null"); if (u && (user.master ? u.master : (u.admin || u.master))) adminUids.add(u.uid); }
     cursor = page.list_complete ? null : page.cursor;
   } while (cursor);
-  if (!best) {
-    await logUnauth(env, device, ip, revokedReason != null ? "Gesperrter Key, App neu installiert" : "App ohne Key geöffnet", body);
-    return json({ ok: false, error: revokedReason != null ? "revoked" : "none", message: revokedReason || "" });
-  }
-  return json({ ok: true, key: best.key, expiresAt: best.rec.expiresAt, name: nameOf(best.rec) });
+  const keyRecs = [];
+  cursor = undefined;
+  do {
+    const page = await env.KEYS.list({ prefix: "key:", cursor });
+    for (const k of page.keys) keyRecs.push(JSON.parse((await env.KEYS.get(k.name)) || "{}"));
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor);
+  const protectedIps = new Set([ipOf(req)]);
+  for (const r of keyRecs) if (r.ip && adminUids.has(r.uid)) protectedIps.add(r.ip);
+
+  const b = await getBlocks(env);
+  const entry = { reason, at: now, by: user.uid, byName: user.name || "" };
+  const out = { devices: 0, ips: 0, skippedIps: 0 };
+  if (body.uid) {
+    const target = await userByUid(env, String(body.uid).toUpperCase().trim());
+    if (!target) return json({ ok: false, error: "unknown" }, 404);
+    if (target.uid === user.uid || target.master || (!user.master && target.admin)) return json({ ok: false, error: "protected" }, 403);
+    b.devices[target.device] = { ...entry, targetUid: target.uid, targetName: target.name || "" };
+    out.devices = 1;
+    if (body.blockIp === true) {
+      for (const r of keyRecs) {
+        if (r.uid !== target.uid || !r.ip) continue;
+        if (protectedIps.has(r.ip)) { out.skippedIps++; continue; }
+        b.ips[r.ip] = { ...entry, targetUid: target.uid, targetName: target.name || "" };
+        out.ips++;
+      }
+    }
+  } else if (body.ip) {
+    const ip = String(body.ip).trim();
+    if (!/^[0-9a-fA-F:.]{3,45}$/.test(ip) || !/[.:]/.test(ip)) return json({ ok: false, error: "format" }, 400);
+    if (protectedIps.has(ip)) return json({ ok: false, error: "protected" }, 403);
+    b.ips[ip] = entry;
+    out.ips = 1;
+  } else return json({ ok: false, error: "format" }, 400);
+  user.blockDay.n++;
+  await put(env, "blocks", JSON.stringify(b));
+  await put(env, "user:" + user.uid, JSON.stringify(user));
+  return json({ ok: true, ...out });
+}
+
+async function adminReqs(req, env, action) {
+  if (action === "reqs") return json({ ok: true, list: (await getReqs(env)).slice().reverse() });
+  const body = await req.json().catch(() => ({}));
+  const r = await decideRequest(env, String(body.id || ""), body.approve === true, body.note, "main");
+  return json(r, r.ok ? 200 : 400);
 }
 const ADMIN_PAGE = `<!doctype html><html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Aero Guard Admin</title>
@@ -591,6 +679,7 @@ details.grp table{margin:0 0 6px}
 <a data-p="create">➕ Key erzeugen</a>
 <a data-p="devices">📱 Geräte</a>
 <a data-p="users">👥 Nutzer &amp; Admins</a>
+<a data-p="reqs">✅ Genehmigungen <span id="reqBadge"></span></a>
 <a data-p="support">💬 Support <span id="supBadge"></span></a>
 <a data-p="unauth">🚨 Meldungen <span id="unBadge"></span></a>
 <a data-p="blocks">⛔ Sperren</a>
@@ -635,8 +724,11 @@ details.grp table{margin:0 0 6px}
 <table id="quotaTbl"></table>
 <p class="row"><button class="sec" id="qAdd">+ Laufzeit hinzufügen</button><button id="qSave">Speichern</button></p></div></section>
 
-<section id="p-support" class="hide"><h2>Support</h2><div class="card"><p class="small">Nachrichten aus der App („Support kontaktieren“). Deine Antwort sieht die Person in der App.</p>
-<div style="overflow:auto"><table id="supTbl"></table></div></div></section>
+<section id="p-reqs" class="hide"><h2>Genehmigungen</h2><div class="card"><p class="small">Key-Anträge von Admins (Laufzeit mit „Genehmigung nötig“). Genehmigst du, entsteht der Key und der Admin sieht ihn in der App und teilt ihn weiter. Lehnst du ab, bekommt der Admin das Kontingent zurück. Du kannst auch direkt in der App unter Einstellungen > Admin entscheiden.</p>
+<div style="overflow:auto"><table id="reqTbl"></table></div></div></section>
+
+<section id="p-support" class="hide"><h2>Support</h2><div class="card"><p class="small">Unterhaltungen aus der App („Support kontaktieren“), mit vollem Verlauf. Du siehst, wer mit wem schreibt. Bei jeder Antwort steht die Rolle (Master-Admin oder Admin) und der Name, den du im Panel gespeichert hast. Admins sehen offene Unterhaltungen in ihrer App und können antworten; du siehst alles hier.</p>
+<div id="supTbl"></div></div></section>
 
 <section id="p-unauth" class="hide"><h2>Meldungen: nicht autorisierter Zugriff</h2><div class="card">
 <p class="small">Versuche ohne gültigen Key: App ohne Key geöffnet, unbekannter oder fremder Key, gesperrtes Gerät. Ein Eintrag je Gerät, höchstens alle 6 Stunden aktualisiert. Die Karte ohne Key ist erlaubt und erscheint hier nicht als Angriff, nur als „App ohne Key geöffnet“.</p>
@@ -670,10 +762,10 @@ function remaining(k){ var s=status(k); if(s!="active") return ""; var d=Math.ma
 function esc(t){ return String(t==null?"":t).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];}); }
 
 function show(p){
-  ["home","create","devices","users","support","unauth","blocks","keys","help"].forEach(function(x){ $("p-"+x).classList.toggle("hide",x!=p); });
+  ["home","create","devices","users","reqs","support","unauth","blocks","keys","help"].forEach(function(x){ $("p-"+x).classList.toggle("hide",x!=p); });
   document.querySelectorAll("#side a[data-p]").forEach(function(a){ a.classList.toggle("on",a.getAttribute("data-p")==p); });
   if(p=="home"||p=="keys"||p=="devices"||p=="users") load();
-  if(p=="support") loadSupport(); if(p=="unauth") loadUnauth(); if(p=="blocks") loadBlocks();
+  if(p=="reqs") loadReqs(); if(p=="support") loadSupport(); if(p=="unauth") loadUnauth(); if(p=="blocks") loadBlocks();
 }
 document.querySelectorAll("#side a[data-p]").forEach(function(a){ a.onclick=function(){ show(a.getAttribute("data-p")); }; });
 
@@ -691,13 +783,13 @@ if(PW) login();
 function load(){ return api("/admin/list").then(function(r){ if(r.ok) apply(r); else location.reload(); }); }
 var USERS=[], EX={};
 function apply(r){ DATA=r.keys; NOW=r.now; USERS=r.users||[]; EX=r; renderHome(); renderKeys(); renderDevs(); renderUsers();
-  $("supBadge").textContent=r.supportOpen?"("+r.supportOpen+")":""; $("unBadge").textContent=r.unauth24?"("+r.unauth24+")":""; }
+  $("reqBadge").textContent=r.reqOpen?"("+r.reqOpen+")":""; $("supBadge").textContent=r.supportOpen?"("+r.supportOpen+")":""; $("unBadge").textContent=r.unauth24?"("+r.unauth24+")":""; }
 function userOf(uid){ return USERS.filter(function(u){return u.uid==uid;})[0]; }
 
 function renderHome(){
   var c={free:0,active:0,expired:0,revoked:0}; DATA.forEach(function(k){ c[status(k)]++; });
   var online=DATA.filter(function(k){return k.lastSeen&&NOW-k.lastSeen<2*3600*1000;}).length, adm=USERS.filter(function(u){return u.admin;}).length, wr=EX.writes||{n:0,limit:1000}, bl=EX.blocked||{devices:0,ips:0};
-  $("stats").innerHTML=[["Keys gesamt",DATA.length],["Frei",c.free],["Aktiv",c.active],["Abgelaufen",c.expired],["Gesperrt",c.revoked],["Nutzer",USERS.length],["Admins",adm],["Online (2 Std.)",online],["Meldungen 24 Std.",EX.unauth24||0],["Support offen",EX.supportOpen||0],["Gesperrte Geräte/IPs",bl.devices+bl.ips],["Schreibvorgänge heute",wr.n+" / "+wr.limit]]
+  $("stats").innerHTML=[["Keys gesamt",DATA.length],["Frei",c.free],["Aktiv",c.active],["Abgelaufen",c.expired],["Gesperrt",c.revoked],["Nutzer",USERS.length],["Admins",adm],["Online (2 Std.)",online],["Meldungen 24 Std.",EX.unauth24||0],["Support offen",EX.supportOpen||0],["Offene Anträge",EX.reqOpen||0],["Gesperrte Geräte/IPs",bl.devices+bl.ips],["Schreibvorgänge heute",wr.n+" / "+wr.limit]]
     .map(function(x){ return '<div class="stat"><b>'+x[1]+'</b><span>'+x[0]+'</span></div>'; }).join("");
   var pct=Math.min(100,Math.round(wr.n/wr.limit*100)); $("wfill").style.width=pct+"%"; $("wfill").style.background=pct>80?"#c0392b":pct>50?"#d4a017":"#3cc47a";
   $("wtext").innerHTML="Verbraucht (gezählt vom Server): <b>"+wr.n+"</b> von "+wr.limit+" · noch frei: <b>"+Math.max(0,wr.limit-wr.n)+"</b> (Tag "+esc(wr.day||"")+", UTC, Zähler setzt sich um 01:00/02:00 Uhr deutscher Zeit zurück).<br>Hinweis: Cloudflare bietet keine Abfrage für den Verbrauch. Der Server zählt seine eigenen Schreibvorgänge mit und speichert den Stand alle 5 Schreibvorgänge. Der Wert ist eine Untergrenze. Der genaue Stand steht im Cloudflare-Dashboard unter Storage &amp; Databases → KV → Metrics.";
@@ -779,35 +871,46 @@ function renderUsers(){
     .sort(function(a,b){return (b.admin?1:0)-(a.admin?1:0)||(b.created||0)-(a.created||0);});
   $("users").innerHTML="<tr><th>ID</th><th>Name</th><th>Handy</th><th>Rolle</th><th>Kontingent (übrig / gesamt)</th><th></th></tr>"+(list.length?list.map(function(u){
     var ks=DATA.filter(function(k){return k.uid==u.uid;}), m=ks[0]&&ks[0].model||"?";
-    var q2=Object.keys(u.quota||{}).sort(function(a,b){return a-b;}).map(function(s){ var x=u.quota[s]; return secLabel(s)+": "+Math.max(0,x.limit-x.used)+"/"+x.limit+(x.reason?" 📝":""); }).join("<br>");
-    return "<tr><td class=mono>"+u.uid+"</td><td><b>"+(esc(u.name)||"<i class=small>ohne Namen</i>")+"</b></td><td>"+esc(m)+"</td><td>"+(u.admin?"<span class='tag active'>Admin</span>":"Nutzer")+"</td><td class=small>"+(u.admin?q2:"–")+"</td><td class=acts>"+
+    var q2=Object.keys(u.quota||{}).sort(function(a,b){return a-b;}).map(function(s){ var x=u.quota[s]; var md=x.mode||(x.reason?"reason":"instant"); return secLabel(s)+": "+Math.max(0,x.limit-x.used)+"/"+x.limit+(md=="approval"?" ✅ Genehmigung":md=="reason"?" 📝 Begründung":""); }).join("<br>");
+    return "<tr><td class=mono>"+u.uid+"</td><td><b>"+(esc(u.name)||"<i class=small>ohne Namen</i>")+"</b></td><td>"+esc(m)+"</td><td>"+(u.master?"<span class='tag active'>Master-Admin</span>":u.admin?"<span class='tag active'>Admin</span>"+(u.canBlock?"<div class=small>darf sperren</div>":""):"Nutzer")+"</td><td class=small>"+(u.admin?q2:"–")+"</td><td class=acts>"+
     "<button class=sec data-n=uName data-u="+u.uid+">Name</button>"+
-    "<button class=sec data-n=uAdmin data-u="+u.uid+">"+(u.admin?"Admin entziehen":"Zum Admin machen")+"</button>"+
-    (u.admin?"<button class=sec data-n=uQuota data-u="+u.uid+">Kontingent</button>":"")+"</td></tr>"; }).join(""):"<tr><td colspan=6 class=small>Keine Nutzer.</td></tr>");
+    "<button class=sec data-n=uAdmin data-u="+u.uid+">"+(u.admin?"Admin entziehen":"Zum Admin machen")+"</button>"+"<button class=sec data-n=uMaster data-u="+u.uid+">"+(u.master?"Master entziehen":"Zum Master-Admin")+"</button>"+
+    (u.admin?"<button class=sec data-n=uQuota data-u="+u.uid+">Kontingent</button><button class=sec data-n=uBlockPerm data-u="+u.uid+">"+(u.canBlock?"Sperren verbieten":"Sperren erlauben")+"</button>":"")+"</td></tr>"; }).join(""):"<tr><td colspan=6 class=small>Keine Nutzer.</td></tr>");
 }
 var QU=null;
-function openQuota(uid){ var u=userOf(uid); QU={uid:uid,rows:Object.keys(u.quota||{}).map(function(s){ var x=u.quota[s]; return {days:s/86400,limit:x.limit,used:x.used,reason:!!x.reason}; })}; drawQuota(); }
+function openQuota(uid){ var u=userOf(uid); QU={uid:uid,rows:Object.keys(u.quota||{}).map(function(s){ var x=u.quota[s]; return {days:s/86400,limit:x.limit,used:x.used,mode:x.mode||(x.reason?"reason":"instant")}; })}; drawQuota(); }
 function drawQuota(){
   var u=userOf(QU.uid); $("quotaCard").classList.remove("hide"); $("quotaTitle").textContent="Kontingent von "+(u.name||u.uid)+" ("+u.uid+")";
-  $("quotaTbl").innerHTML="<tr><th>Laufzeit (Tage)</th><th>Kontingent</th><th>Schon ausgegeben</th><th>Grund nötig</th><th></th></tr>"+QU.rows.map(function(r,i){
-    return "<tr><td><input data-q=days data-i="+i+" value='"+r.days+"' style='width:90px'></td><td><input data-q=limit data-i="+i+" value='"+r.limit+"' style='width:80px'></td><td><input data-q=used data-i="+i+" value='"+r.used+"' style='width:80px'></td><td><input type=checkbox data-q=reason data-i="+i+(r.reason?" checked":"")+"></td><td><button class=red data-n=qDel data-i="+i+">×</button></td></tr>"; }).join("");
+  $("quotaTbl").innerHTML="<tr><th>Laufzeit (Tage)</th><th>Kontingent</th><th>Schon ausgegeben</th><th>Ausgabe</th><th></th></tr>"+QU.rows.map(function(r,i){
+    return "<tr><td><input data-q=days data-i="+i+" value='"+r.days+"' style='width:90px'></td><td><input data-q=limit data-i="+i+" value='"+r.limit+"' style='width:80px'></td><td><input data-q=used data-i="+i+" value='"+r.used+"' style='width:80px'></td><td><select data-q=mode data-i="+i+"><option value=instant"+(r.mode=="instant"?" selected":"")+">sofort</option><option value=reason"+(r.mode=="reason"?" selected":"")+">mit Begründung</option><option value=approval"+(r.mode=="approval"?" selected":"")+">Genehmigung nötig</option></select></td><td><button class=red data-n=qDel data-i="+i+">×</button></td></tr>"; }).join("");
 }
 function readQuota(){ document.querySelectorAll("#quotaTbl [data-q]").forEach(function(el){ var r=QU.rows[+el.getAttribute("data-i")], f=el.getAttribute("data-q");
-  if(f=="reason") r.reason=el.checked; else r[f]=parseFloat(String(el.value).replace(",","."))||0; }); }
-$("qAdd").onclick=function(){ readQuota(); QU.rows.push({days:30,limit:1,used:0,reason:true}); drawQuota(); };
-$("qSave").onclick=function(){ readQuota(); var q={}; QU.rows.forEach(function(r){ if(r.days>0) q[Math.round(r.days*86400)]={limit:r.limit,used:r.used,reason:r.reason}; });
+  if(f=="mode") r.mode=el.value; else r[f]=parseFloat(String(el.value).replace(",","."))||0; }); }
+$("qAdd").onclick=function(){ readQuota(); QU.rows.push({days:30,limit:1,used:0,mode:"approval"}); drawQuota(); };
+$("qSave").onclick=function(){ readQuota(); var q={}; QU.rows.forEach(function(r){ if(r.days>0) q[Math.round(r.days*86400)]={limit:r.limit,used:r.used,mode:r.mode}; });
   api("/admin/user",{uid:QU.uid,quota:q}).then(function(r){ return dlg(r.ok?"Gespeichert":"Fehler",r.ok?"Das Kontingent gilt sofort. Die App holt es beim nächsten Öffnen des Admin-Werkzeugs.":String(r.error),"",false,true); }).then(load); };
 
+var RS={pending:"wartet",approved:"genehmigt",rejected:"abgelehnt"};
+function loadReqs(){ api("/admin/reqs").then(function(r){ if(!r.ok) return;
+  $("reqTbl").innerHTML="<tr><th>Wer</th><th>Laufzeit</th><th>Begründung / für wen</th><th>Status</th><th></th></tr>"+(r.list.length?r.list.map(function(q){
+    return "<tr><td><b>"+(esc(q.name)||"?")+"</b><div class='small mono'>"+esc(q.uid)+"</div><div class=small>"+fmtDate(q.t)+"</div></td><td>"+fmtDur(q.seconds)+"</td><td style='max-width:300px'>"+esc(q.reason)+(q.label?"<div class=small>für "+esc(q.label)+"</div>":"")+"</td><td><span class='tag "+(q.status=="approved"?"active":q.status=="rejected"?"revoked":"free")+"'>"+RS[q.status]+"</span>"+(q.key?"<div class='small mono'>"+q.key+"</div>":"")+(q.note?"<div class=small>"+esc(q.note)+"</div>":"")+"</td><td class=acts>"+
+    (q.status=="pending"?"<button data-n=rOk data-id="+q.id+">Genehmigen</button><button class=red data-n=rNo data-id="+q.id+">Ablehnen</button>":"")+"</td></tr>"; }).join(""):"<tr><td colspan=5 class=small>Keine Anträge.</td></tr>"); }); }
+function roleName(m){ return (m.role=="master"?"Master-Admin":"Admin")+(m.name?" · "+m.name:""); }
 function loadSupport(){ api("/admin/support").then(function(r){ if(!r.ok) return;
-  $("supTbl").innerHTML="<tr><th>Von</th><th>Nachricht</th><th>Antwort</th><th></th></tr>"+(r.msgs.length?r.msgs.map(function(m){
-    return "<tr><td><b>"+(esc(m.name)||"?")+"</b><div class='small mono'>"+esc(m.uid||"")+" · "+esc(m.model||"")+"</div><div class=small>"+fmtDate(m.t)+"</div></td><td style='max-width:340px'>"+esc(m.text)+"</td><td style='max-width:280px'>"+(m.reply?esc(m.reply):"<i class=small>noch keine</i>")+"</td><td class=acts>"+
-    "<button data-n=sReply data-id="+m.id+">Antworten</button><button class=sec data-n=sDone data-id="+m.id+" data-d="+(m.done?0:1)+">"+(m.done?"Wieder öffnen":"Erledigt")+"</button><button class=red data-n=sDel data-id="+m.id+">Löschen</button></td></tr>"; }).join(""):"<tr><td colspan=4 class=small>Keine Nachrichten.</td></tr>"); }); }
+  $("supTbl").innerHTML=r.convs.length?r.convs.map(function(c){
+    var staff={}; c.msgs.forEach(function(m){ if(m.from=="staff") staff[roleName(m)]=1; });
+    var parts=Object.keys(staff).join(", ")||"noch niemand";
+    var chat=c.msgs.map(function(m){ var me=m.from=="user";
+      return "<div style='margin:6px 0;padding:8px 10px;border-radius:10px;max-width:640px;background:"+(me?"#10263c":"#17402f")+";"+(me?"":"margin-left:40px")+"'><div class=small><b>"+(me?esc(c.name||c.uid||"Nutzer")+" (Nutzer)":esc(roleName(m)))+"</b> · "+fmtDate(m.t)+"</div>"+esc(m.text)+"</div>"; }).join("");
+    return "<div class=card style='margin-bottom:12px'><div class=row style='justify-content:space-between'><div><b>"+(esc(c.name)||"<i class=small>ohne Namen</i>")+"</b> <span class='small mono'>"+esc(c.uid||"")+" · "+esc(c.model||"")+"</span><div class=small>Schreibt mit: "+esc(parts)+" · zuletzt "+fmtDate(c.updated)+"</div></div><span class='tag "+(c.status=="open"?"free":"active")+"'>"+(c.status=="open"?"offen":"erledigt")+"</span></div>"+chat+
+    "<div class=acts style='margin-top:8px'><button data-n=sReply data-id="+c.id+">Antworten</button><button class=sec data-n=sDone data-id="+c.id+" data-d="+(c.status=="open"?1:0)+">"+(c.status=="open"?"Erledigt":"Wieder öffnen")+"</button><button class=red data-n=sDel data-id="+c.id+">Löschen</button></div></div>"; }).join(""):"<p class=small>Keine Unterhaltungen.</p>"; }); }
 function loadUnauth(){ api("/admin/unauth").then(function(r){ if(!r.ok) return;
   $("unTbl").innerHTML="<tr><th>Gerät</th><th>Was</th><th>Wann</th><th>Anzahl</th><th></th></tr>"+(r.list.length?r.list.map(function(e){
     return "<tr><td><div class=mono>"+esc(e.device||e.id)+"</div><div class=small>"+esc(e.model||"")+" "+esc(e.version||"")+(e.ip?" · IP "+esc(e.ip):"")+"</div></td><td>"+esc(e.why)+"</td><td>"+fmtDate(e.t)+"<div class=small>erstmals "+fmtDate(e.first)+"</div></td><td>"+e.n+"</td><td class=acts>"+
     (e.device?"<button class=red data-n=unBlock data-t=device data-id='"+esc(e.id)+"'>Gerät sperren</button>":"")+(e.ip?"<button class=red data-n=unBlock data-t=ip data-id='"+esc(e.id)+"'>IP sperren</button>":"")+"</td></tr>"; }).join(""):"<tr><td colspan=5 class=small>Keine Meldungen.</td></tr>"); }); }
 function loadBlocks(){ api("/admin/blocks").then(function(r){ if(!r.ok) return;
-  var rows=r.devices.map(function(d){ return {t:"device",id:d.full,label:"Gerät "+d.id,why:d.reason,at:d.at}; }).concat(r.ips.map(function(d){ return {t:"ip",id:d.id,label:"IP "+d.id,why:d.reason,at:d.at}; }));
+  function who(d){ return d.by?" · gesperrt von "+(d.byName||d.by)+" ("+d.by+")":""; }
+  var rows=r.devices.map(function(d){ return {t:"device",id:d.full,label:"Gerät "+d.id+(d.targetUid?" ("+(d.targetName||d.targetUid)+", "+d.targetUid+")":""),why:d.reason+who(d),at:d.at}; }).concat(r.ips.map(function(d){ return {t:"ip",id:d.id,label:"IP "+d.id+(d.targetUid?" ("+(d.targetName||d.targetUid)+")":""),why:d.reason+who(d),at:d.at}; }));
   $("blTbl").innerHTML="<tr><th>Gesperrt</th><th>Grund</th><th>Seit</th><th></th></tr>"+(rows.length?rows.map(function(x){
     return "<tr><td class=mono>"+esc(x.label)+"</td><td>"+esc(x.why)+"</td><td>"+fmtDate(x.at)+"</td><td><button class=sec data-n=unblock data-t="+x.t+" data-id='"+esc(x.id)+"'>Entsperren</button></td></tr>"; }).join(""):"<tr><td colspan=4 class=small>Nichts gesperrt.</td></tr>"); }); }
 $("main").addEventListener("click",function(e){
@@ -816,6 +919,9 @@ $("main").addEventListener("click",function(e){
   if(n=="uName"){ dlg("Name","Name für "+u+":",(userOf(u)||{}).name||"",true).then(function(v){ if(v===null) return; return api("/admin/user",{uid:u,name:v}).then(fin).then(load); }); }
   else if(n=="uAdmin"){ var me=userOf(u); dlg(me.admin?"Admin entziehen":"Zum Admin machen",(me.admin?"Admin-Rolle von ":"")+(me.name||u)+(me.admin?" entziehen?":" zum Admin machen? Die App zeigt dann das Admin-Werkzeug (nach dem nächsten Öffnen). Ein Standard-Kontingent wird angelegt, das du danach ändern kannst.")).then(function(ok){ if(!ok) return; return api("/admin/user",{uid:u,admin:!me.admin}).then(fin).then(load).then(function(){ if(!me.admin) openQuota(u); }); }); }
   else if(n=="uQuota"){ openQuota(u); }
+  else if(n=="uMaster"){ var m3=userOf(u); dlg(m3.master?"Master entziehen":"Zum Master-Admin machen",m3.master?"Master-Rolle von "+(m3.name||u)+" entziehen?":(m3.name||u)+" wird Master-Admin: sieht in der App alle Keys, Support-Nachrichten und offene Genehmigungen, entscheidet über Anträge und darf sperren (außer andere Master).").then(function(ok){ if(!ok) return; return api("/admin/user",{uid:u,master:!m3.master}).then(fin).then(load); }); }
+  else if(n=="rOk"||n=="rNo"){ var ap=n=="rOk"; dlg(ap?"Genehmigen":"Ablehnen",ap?"Antrag genehmigen? Der Key wird erzeugt und erscheint beim Admin.":"Grund der Ablehnung (optional, der Admin sieht ihn):","",!ap).then(function(v){ if(v===false||v===null) return; return api("/admin/req-decide",{id:id,approve:ap,note:typeof v=="string"?v:""}).then(fin).then(loadReqs).then(load); }); }
+  else if(n=="uBlockPerm"){ var me2=userOf(u); dlg(me2.canBlock?"Sperren verbieten":"Sperren erlauben",me2.canBlock?(me2.name||u)+" darf nicht mehr sperren.":(me2.name||u)+" darf in der App Geräte und IPs sperren (nur mit Grund, nie Admins, höchstens 10 pro Tag). Du siehst jede Sperre hier unter „Sperren“ mit Namen und kannst sie aufheben.").then(function(ok){ if(!ok) return; return api("/admin/user",{uid:u,canBlock:!me2.canBlock}).then(fin).then(load); }); }
   else if(n=="qDel"){ readQuota(); QU.rows.splice(+b.getAttribute("data-i"),1); drawQuota(); }
   else if(n=="sReply"){ dlg("Antworten","Antwort an den Nutzer (er sieht sie in der App):","",true).then(function(v){ if(!v) return; return api("/admin/support-reply",{id:id,reply:v}).then(fin).then(loadSupport).then(load); }); }
   else if(n=="sDone"){ api("/admin/support-done",{id:id,done:b.getAttribute("data-d")=="1"}).then(loadSupport).then(load); }
@@ -861,6 +967,7 @@ export default {
         if (action === "create" && req.method === "POST") return await adminCreate(req, env);
         if (action === "list") return await adminList(env);
         if (["revoke", "unrevoke", "delete", "reset", "extend", "rename"].includes(action) && req.method === "POST") return await adminAction(req, env, action);
+        if (["reqs", "req-decide"].includes(action)) return await adminReqs(req, env, action);
         if (action === "user" && req.method === "POST") return await adminUser(req, env);
         if (["blocks", "block", "unblock"].includes(action)) return await adminBlocks(req, env, action);
         if (["unauth", "unauth-clear"].includes(action)) return await adminUnauth(req, env, action);
