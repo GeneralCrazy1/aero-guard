@@ -3,6 +3,7 @@
   "versionName": "1.1.4b (Alpha)",
   "apkUrl": "Aero-Guard.apk",
   "changes": [
+    "Ruhezeit: Das Radar läuft jetzt auch in der Ruhezeit weiter (Radar, Liste und Karte bleiben aktuell), es meldet nur nichts. Vorher wurde es pausiert. Die Einstellungen erklären Ruhezeit und Zeitplan neu und warnen, wenn sich beide überschneiden. Widget-Text korrigiert (ein Icon, drei Zustände).",
     "Admin-Bereich komplett neu: Vollbild mit Menü ☰ (Master: Übersicht, Key erzeugen, Nutzer & Admins, Alle Keys, Genehmigungen, Support, Meldungen, Sperren; Admin: Übersicht, Key holen, Meine Keys, Anträge, Support). Eintrag „Admin“ unten in der Leiste, nur für Admins.",
     "Diagnose unter Einstellungen > Freischaltung (Build-Nummer, User-ID, Rolle laut Server, Verbindung testen).",
     "Karte: Knopf „Alle Flieger“ und „Mein Standort“, Zeile mit den nächsten Fliegern, einklappbarer Infotext, Flugplatznamen ohne Überlappung (erst beim Hineinzoomen).",
