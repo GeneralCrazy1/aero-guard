@@ -1,9 +1,10 @@
 {
-  "versionCode": 17,
-  "versionName": "1.1.3B",
+  "versionCode": 18,
+  "versionName": "1.1.3C",
   "apkUrl": "Aero-Guard.apk",
   "changes": [
-    "Ohne gültigen Key sind Radar, Liste, Karte und Test jetzt gesperrt. Es erscheint ein Sperrbildschirm mit „Key eingeben“. Die Einstellungen bleiben offen, dort steht auch die Freischaltung.",
-    "Militärflugplätze: Beim Antippen zeigt die App jetzt ein Bild und einen Kurztext von Wikipedia (Wikimedia Commons, freie Lizenz). Passt kein Treffer, gibt es lieber kein Bild."
+    "Gemeinsamer Stand: Welcher Jet an welchem Militärflugplatz gelandet oder gestartet ist, teilen jetzt alle Tester. Auch eine frisch installierte App zeigt sofort den aktuellen Stand. Jedes Ereignis zählt nur einmal, egal wie viele Handys es sehen.",
+    "Deine Antworten auf „War der Flieger laut?“ fließen in eine gemeinsame Hörweite je Flugzeugtyp ein. Geteilt werden nie Standorte, nur Flugplatz, Flugzeugkennung, Uhrzeit sowie Typ, Entfernung und Ja/Nein. In den Einstellungen abschaltbar.",
+    "Widget: Nur noch ein Icon. Jeder Tipp schaltet weiter: Aus, An, Ruhe an (mit Uhrzeit), dann wieder Aus. Farbe und Symbol zeigen den Zustand."
   ]
 }

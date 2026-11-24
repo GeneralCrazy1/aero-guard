@@ -169,6 +169,76 @@ async function adminAction(req, env, action) {
   return json({ ok: true });
 }
 
+// ---- Gemeinsamer Stand der Tester: Flugplätze + Hörweiten ----
+//   POST /share {key, device, events:[{icao,hex,kind:"L"|"T",t,label}], answers:[{key,slant,factor,loud,base}], reset?}
+//   -> {ok, parked:{ICAO:[{hex,since,label}]}, ranges:{TYP:km}}
+// Alles liegt in EINEM KV-Eintrag "af:state". Es wird nur geschrieben, wenn sich etwas ändert
+// (doppelte Meldungen desselben Ereignisses von mehreren Handys ändern nichts). Standorte werden nie gespeichert.
+const AF_KEEP_MS = 30 * 86400 * 1000;
+function learnRange(base, slant, factor, loud) {
+  const needed = slant / Math.max(factor, 0.1);
+  let next = base;
+  if (loud) { const t = needed * 1.15; if (base < t) next = base + 0.6 * (t - base); }
+  else { const t = needed * 0.85; if (base > t) next = base - 0.6 * (base - t); }
+  return Math.min(30, Math.max(1.5, next));
+}
+async function share(req, env) {
+  let body;
+  try { body = await req.json(); } catch { return json({ ok: false, error: "format" }, 400); }
+  const key = normalize(body.key);
+  const device = String(body.device || "").slice(0, 100);
+  if (!key || !device) return json({ ok: false, error: "format" }, 400);
+  const rec = JSON.parse((await env.KEYS.get("key:" + key)) || "null");
+  const now = Date.now();
+  if (!rec || rec.revoked || !rec.device || rec.device !== device || now >= rec.expiresAt) return json({ ok: false, error: "auth" }, 403);
+
+  const st = JSON.parse((await env.KEYS.get("af:state")) || "{}");
+  const parked = st.parked || {};
+  const ranges = st.ranges || {};
+  let changed = false;
+  if (body.reset === true) { for (const k of Object.keys(parked)) delete parked[k]; changed = true; }
+
+  const events = Array.isArray(body.events) ? body.events.slice(0, 40) : [];
+  for (const ev of events) {
+    const icao = String((ev && ev.icao) || "").toUpperCase();
+    const hex = String((ev && ev.hex) || "").toLowerCase();
+    if (!/^[A-Z0-9]{3,5}$/.test(icao) || !/^[0-9a-f]{6}$/.test(hex)) continue;
+    let t = Number(ev.t);
+    if (!isFinite(t) || t > now + 600000 || t < now - 6 * 3600000) t = now;
+    const here = parked[icao] && parked[icao][hex];
+    if (ev.kind === "L") {
+      if (here) continue;
+      let newer = false;
+      for (const f of Object.keys(parked)) if (parked[f][hex] && parked[f][hex].s > t) newer = true;
+      if (newer) continue;
+      for (const f of Object.keys(parked)) if (parked[f][hex]) delete parked[f][hex];
+      (parked[icao] = parked[icao] || {})[hex] = { s: t, l: String(ev.label || "").slice(0, 60) };
+      changed = true;
+    } else if (ev.kind === "T") {
+      if (here && here.s <= t) { delete parked[icao][hex]; changed = true; }
+    }
+  }
+
+  const answers = Array.isArray(body.answers) ? body.answers.slice(0, 20) : [];
+  for (const a of answers) {
+    const k = String((a && a.key) || "").toUpperCase().slice(0, 30);
+    const slant = Number(a.slant), factor = Number(a.factor), base = Number(a.base);
+    if (!/^[A-Z0-9_]{2,30}$/.test(k) || !isFinite(slant) || !isFinite(factor) || slant <= 0) continue;
+    const cur = ranges[k] != null ? ranges[k] : (isFinite(base) ? Math.min(30, Math.max(1.5, base)) : 8);
+    const next = Math.round(learnRange(cur, slant, factor, a.loud === true) * 100) / 100;
+    if (ranges[k] == null || next !== ranges[k]) { ranges[k] = next; changed = true; }
+  }
+
+  for (const f of Object.keys(parked)) {
+    for (const h of Object.keys(parked[f])) if (now - parked[f][h].s > AF_KEEP_MS) { delete parked[f][h]; changed = true; }
+    if (!Object.keys(parked[f]).length) delete parked[f];
+  }
+  if (changed) await env.KEYS.put("af:state", JSON.stringify({ parked, ranges }));
+
+  const out = {};
+  for (const f of Object.keys(parked)) out[f] = Object.keys(parked[f]).map((h) => ({ hex: h, since: parked[f][h].s, label: parked[f][h].l }));
+  return json({ ok: true, now, parked: out, ranges });
+}
 const ADMIN_PAGE = `<!doctype html><html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Aero Guard Admin</title>
 <style>
@@ -208,7 +278,9 @@ details.grp .cnt{background:#17402f;border-radius:10px;padding:2px 10px;font-siz
 details.grp table{margin:0 0 6px}
 .acts button{padding:4px 8px;font-size:12px;margin:1px}
 @media(max-width:720px){body{flex-direction:column}#side{width:100%;height:auto;flex-direction:row;flex-wrap:wrap;position:static}#side h1{width:100%}#side .sp{display:none}}
+#modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99;align-items:center;justify-content:center}#modal.on{display:flex}#modal .box{background:#1c2430;color:#fff;border-radius:10px;padding:20px;max-width:440px;width:90%}#modal h3{margin:0 0 8px}#modal p{margin:0 0 12px;line-height:1.4}#modal input{width:100%;box-sizing:border-box;margin-bottom:12px}#modal .row{display:flex;gap:8px;justify-content:flex-end}
 </style></head><body>
+<div id="modal"><div class="box"><h3 id="mT"></h3><p id="mM"></p><input id="mI"><div class="row"><button class="sec" id="mC">Abbrechen</button><button id="mO">OK</button></div></div></div>
 <div id="login"><div class="card"><h2>Aero Guard Admin</h2><label>Admin-Passwort</label>
 <input id="pw" type="password" style="width:100%" autofocus><p><button id="loginBtn" style="width:100%">Anmelden</button></p><div id="loginMsg" class="small"></div></div></div>
 
@@ -338,16 +410,24 @@ function renderDevs(){
 }
 $("devs").onclick=function(e){ $("keys").onclick(e); };
 $("q").oninput=renderKeys; $("flt").onchange=renderKeys; $("reload").onclick=load;
+function dlg(title,msg,defVal,withInput,noCancel){ return new Promise(function(res){
+  $("mT").textContent=title; $("mM").textContent=msg; var i=$("mI"); i.style.display=withInput?"block":"none"; i.value=defVal||"";
+  $("mC").style.display=noCancel?"none":"inline-block"; $("modal").className="on"; if(withInput){ i.focus(); i.select(); } else $("mO").focus();
+  function done(v){ $("modal").className=""; $("mO").onclick=$("mC").onclick=i.onkeydown=null; res(v); }
+  $("mO").onclick=function(){ done(withInput?i.value:true); }; $("mC").onclick=function(){ done(withInput?null:false); };
+  i.onkeydown=function(ev){ if(ev.key=="Enter") $("mO").onclick(); if(ev.key=="Escape") $("mC").onclick(); };
+}); }
 $("keys").onclick=function(e){
   var b=e.target.closest("button"); if(!b) return; var a=b.getAttribute("data-a"), k=b.getAttribute("data-k");
-  if(a=="copy"){ navigator.clipboard.writeText(k); b.textContent="✓"; return; }
-  if(a=="rename"){ var cur=(DATA.filter(function(x){return x.key==k;})[0]||{}).name||""; var nn=prompt("Name für dieses Gerät:",cur); if(nn===null) return; api("/admin/rename",{key:k,name:nn}).then(load); return; }
-  if(a=="delete"&&!confirm("Key "+k+" endgültig löschen?")) return;
-  if(a=="revoke"&&!confirm("Lizenz von Key "+k+" entziehen? Die App sperrt sich, sobald das Handy Internet hat (spätestens nach rund einer Stunde).")) return;
-  if(a=="reset"&&!confirm("Key "+k+" vom Handy lösen? Die Laufzeit startet beim nächsten Einlösen neu.")) return;
-  var body={key:k};
-  if(a=="extend"){ var v=prompt("Wie viele Tage verlängern? (Kommazahl erlaubt, z. B. 0.5 = 12 Std.)","30"); if(!v) return; body.seconds=Math.round(parseFloat(v.replace(",","."))*86400); }
-  api("/admin/"+a,body).then(function(r){ if(!r.ok) alert("Fehler: "+(r.error||"?")); load(); });
+  if(a=="copy"){ try{ navigator.clipboard.writeText(k); }catch(x){} b.textContent="✓"; return; }
+  var body={key:k}, ask=Promise.resolve(true);
+  if(a=="rename"){ var cur=(DATA.filter(function(x){return x.key==k;})[0]||{}).name||"";
+    ask=dlg("Name ändern","Name für dieses Gerät:",cur,true).then(function(v){ if(v===null) return false; body.name=v; return true; }); }
+  else if(a=="delete") ask=dlg("Löschen","Key "+k+" endgültig löschen?");
+  else if(a=="revoke") ask=dlg("Lizenz entziehen","Lizenz von Key "+k+" entziehen? Die App sperrt sich, sobald das Handy Internet hat (spätestens nach rund einer Stunde).");
+  else if(a=="reset") ask=dlg("Handy lösen","Key "+k+" vom Handy lösen? Die Laufzeit startet beim nächsten Einlösen neu.");
+  else if(a=="extend") ask=dlg("Verlängern","Wie viele Tage verlängern? (Kommazahl erlaubt, z. B. 0.5 = 12 Std.)","30",true).then(function(v){ if(!v) return false; var n=parseFloat(v.replace(",",".")); if(!(n>0)) return false; body.seconds=Math.round(n*86400); return true; });
+  ask.then(function(ok){ if(!ok) return; return api("/admin/"+a,body).then(function(r){ if(!r.ok) return dlg("Fehler",String(r.error||"?"),"",false,true); }).then(load); });
 };
 
 var PRESETS=[["30 Sek.",30],["1 Min.",60],["5 Min.",300],["1 Std.",3600],["1 Tag",86400],["7 Tage",604800],["30 Tage",2592000],["90 Tage",7776000],["180 Tage",15552000],["1 Jahr",31536000]];
@@ -372,6 +452,7 @@ export default {
     if (!env.KEYS) return json({ ok: false, error: "server", message: "KV-Speicher KEYS fehlt (siehe Anleitung)." }, 500);
     try {
       if (url.pathname === "/activate" && req.method === "POST") return await activate(req, env, false);
+      if (url.pathname === "/share" && req.method === "POST") return await share(req, env);
       if (url.pathname === "/check" && req.method === "POST") return await activate(req, env, true);
       if (url.pathname === "/admin" || url.pathname === "/admin/") return new Response(ADMIN_PAGE, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
       if (url.pathname.startsWith("/admin/")) {
